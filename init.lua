@@ -7,10 +7,7 @@ M.config = {
   problem_id = nil,
   base_url = "https://kilonova.ro/api",
   poll_interval = 2,
-  window = {
-    width = 0.8,
-    height = 0.6,
-  }
+  panel_width = 62  -- Width adjusted to fit content + border
 }
 
 -- State
@@ -84,51 +81,108 @@ local function login(callback)
 end
 
 local function create_results_window()
+  -- Reuse existing window if valid
   if results_window and vim.api.nvim_win_is_valid(results_window) then
-    vim.api.nvim_win_close(results_window, true)
+    return vim.api.nvim_win_get_buf(results_window)
   end
 
-  local width = math.floor(vim.o.columns * M.config.window.width)
-  local height = math.floor(vim.o.lines * M.config.window.height)
-  local row = math.floor((vim.o.lines - height) / 2)
-  local col = math.floor((vim.o.columns - width) / 2)
+  -- Create new window and buffer
+  local ui = vim.api.nvim_list_uis()[1]
+  local width = M.config.panel_width - 2  -- Account for border
+  local height = ui.height - 2            -- Account for status lines
 
   local buf = vim.api.nvim_create_buf(false, true)
   results_window = vim.api.nvim_open_win(buf, true, {
     relative = 'editor',
     width = width,
     height = height,
-    row = row,
-    col = col,
+    row = 1,  -- Below status line
+    col = ui.width - M.config.panel_width,
     style = 'minimal',
     border = 'rounded'
   })
-  -- Make buffer non-editable
   vim.api.nvim_buf_set_option(buf, 'readonly', true)
   return buf
+end
+
+function split(inputstr, sep)
+    if sep == nil then
+        sep = "%s"
+    end
+    local t = {}
+    for str in string.gmatch(inputstr, "([^" .. sep .. "]+)") do
+        table.insert(t, str)
+    end
+    return t
 end
 
 local function render_results(data)
   local buf = create_results_window()
   local lines = {}
+  local highlights = {}
+
   -- Header
   table.insert(lines, string.format("Submission #%d - %s", data.id, data.status))
   table.insert(lines, string.format("Score: %d/%d", data.score, data.problem.score_scale))
   table.insert(lines, "")
   
+  -- Table Header
+  table.insert(lines, string.format("%-8s %-8s %-20s %-10s %-10s", "Result", "Test", "Verdict", "Time", "Memory"))
+  table.insert(lines, string.rep("-", 60))
+
   -- Tests
-  for _, test in ipairs(data.subtests) do
-    local icon = test.percentage == 100 and "✅" or "❌"
-    local line = string.format("%s Test %d: %s (%.3fs, %dKB)",
-      icon, test.visible_id, test.verdict, test.time, test.memory)
-    table.insert(lines, line)
+  for idx, test in ipairs(data.subtests) do
+    local icon = (test.percentage or 0) == 100 and "✅" or "❌"
+
+    local verdict_str = "waiting..."
+    if test.verdict then
+      local parts = split(test.verdict, ":")
+      verdict_str = (parts[2] and vim.trim(parts[2])) or parts[1] or "waiting..."
+    end
+
+    local time_str = test.time and string.format("%.3fs", test.time) or "waiting..."
+    local memory_str = test.memory and string.format("%dKB", test.memory) or "waiting..."
+
+    table.insert(lines, string.format(
+      "%-8s %-8d %-20s %-10s %-10s",
+      icon,
+      test.visible_id or 0,
+      verdict_str,
+      time_str,
+      memory_str
+    ))
+
+    -- Highlighting
+    local line_num = idx + 4
+    local start_col = 8 + 1 + 8 + 1
+    local end_col = start_col + #verdict_str
+
+    local vlower = verdict_str:lower()
+    local hl_group = (vlower == "success") and "DiffAdd"
+                   or (vlower == "waiting...") and "Comment"
+                   or "DiffDelete"
+
+    table.insert(highlights, {
+      line = line_num,
+      hl = hl_group,
+      col_start = start_col,
+      col_end = end_col,
+    })
   end
 
+  -- Update buffer content
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  
-  -- Set highlights
-  vim.api.nvim_buf_add_highlight(buf, -1, "DiffAdd", 0, 0, -1)
-  vim.api.nvim_buf_add_highlight(buf, -1, "DiffDelete", 1, 0, -1)
+
+  -- Clear old highlights and apply new ones
+  vim.api.nvim_buf_clear_namespace(buf, -1, 0, -1)
+  for _, h in ipairs(highlights) do
+    vim.api.nvim_buf_add_highlight(buf, -1, h.hl, h.line, h.col_start, h.col_end)
+  end
+
+  -- Header highlights
+  vim.api.nvim_buf_add_highlight(buf, -1, "Title", 0, 0, -1)
+  vim.api.nvim_buf_add_highlight(buf, -1, "Title", 1, 0, -1)
+  vim.api.nvim_buf_add_highlight(buf, -1, "Comment", 3, 0, -1)
 end
 
 local handle_poll_response
@@ -158,14 +212,16 @@ handle_poll_response = function (response)
     end)
     return
   end
+
+  vim.schedule(function()
+    render_results(data.data)
+  end)
+
   if data.data.status ~= "finished" then
     poll_timer = vim.defer_fn(function()
       poll_submission(data.data.id)
     end, M.config.poll_interval * 1000)
   else
-    vim.schedule(function()
-      render_results(data.data)
-    end)
     poll_timer = nil
   end
 end
